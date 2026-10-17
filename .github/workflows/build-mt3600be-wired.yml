@@ -1,0 +1,216 @@
+name: Build ImmortalWrt (GL-MT3600BE · 有线版)
+
+# 有线版：去掉整套无线（MTK 闭源 WiFi7 驱动栈 + hostapd/wpad），当纯有线路由器用。
+# 保留：HNAT 硬件加速、turboacc、2.5G PHY 固件、风扇、USB。
+# 直接编译上游代码，不需要 fork、不需要 PAT。
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "源码仓库 URL（默认上游；想编自己的 fork 就换掉）"
+        type: string
+        required: true
+        default: "https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git"
+      source_branch:
+        description: "源码分支"
+        type: choice
+        required: true
+        default: "25.12-dev-wifi7"
+        options:
+          - "25.12-dev-wifi7"
+          - "25.12"
+      defconfig:
+        description: "defconfig 路径"
+        type: string
+        required: true
+        default: "defconfig/low-mem-512m/mt7987-mt7993-be3600.config"
+      device:
+        description: "设备 profile 名"
+        type: string
+        required: true
+        default: "glinet_gl-mt3600be"
+      extra_packages:
+        description: "额外软件包（空格分隔，可留空）"
+        type: string
+        required: false
+        default: ""
+      verbose:
+        description: "输出详细日志（排错用）"
+        type: boolean
+        required: false
+        default: false
+  push:
+    tags:
+      - "v*-wired"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VARIANT: wired
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      REPO: ${{ github.event.inputs.source_repo || 'https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git' }}
+      BRANCH: ${{ github.event.inputs.source_branch || '25.12-dev-wifi7' }}
+      DEFCONFIG: ${{ github.event.inputs.defconfig || 'defconfig/low-mem-512m/mt7987-mt7993-be3600.config' }}
+      DEVICE: ${{ github.event.inputs.device || 'glinet_gl-mt3600be' }}
+      EXTRA: ${{ github.event.inputs.extra_packages || '' }}
+
+    steps:
+      - name: 清理 runner 磁盘
+        uses: jlumbroso/free-disk-space@v2.0.0
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get -qq update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -qq -y install \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget ccache libelf-dev
+          df -h /
+
+      - name: 拉取上游源码
+        run: |
+          if ! git ls-remote --heads "$REPO" "$BRANCH" | grep -q .; then
+            echo "::error::仓库 $REPO 上不存在分支 $BRANCH"
+            exit 1
+          fi
+          git clone --depth 1 --branch "$BRANCH" "$REPO" openwrt
+          cd openwrt
+          git log -1 --format='编译源码: %h %ad %s' --date=short
+
+      - name: 更新并安装 feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成 .config（关掉无线）
+        working-directory: openwrt
+        run: |
+          cp "$DEFCONFIG" .config
+          # 清掉可能把 DEVICE_PACKAGES 覆盖成空的条目（issue #101 的坑）
+          sed -i '/^CONFIG_TARGET_DEVICE_PACKAGES_/d' .config
+          cat >> .config <<CONF
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_MULTI_PROFILE=y
+          CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${DEVICE}=y
+          CONFIG_PACKAGE_kmod-mt798x-2p5g-phy=y
+          CONFIG_PACKAGE_mt798x-2p5g-phy-firmware-internal=y
+          CONFIG_CCACHE=y
+          CONF
+
+          # 去掉整套无线：MTK 闭源 WiFi7 驱动栈 + hostapd/wpad + 配置工具
+          for p in \
+            kmod-mt_wifi7 kmod-mt_wifi_osal kmod-mt_hwifi kmod-mtk_pci \
+            kmod-connac_if kmod-mt7993 kmod-warp \
+            wifi-profile mtwifi-cfg-ucode luci-app-mtwifi-cfg mwctl \
+            wpad-openssl hostapd-common hostapd-utils wpa-cli
+          do
+            echo "# CONFIG_PACKAGE_$p is not set" >> .config
+          done
+
+          for p in $EXTRA; do echo "CONFIG_PACKAGE_$p=y" >> .config; done
+          make defconfig
+
+          echo "---------- 应该还在的（硬件加速/PHY/风扇） ----------"
+          grep -E '^CONFIG_PACKAGE_(kmod-mediatek_hnat|mtkhnat_util|kmod-mt798x-2p5g-phy|mt798x-2p5g-phy-firmware-internal|luci-app-turboacc-mtk|kmod-hwmon-pwmfan)=y' .config || true
+
+          echo "---------- 检查无线是否真的关掉了 ----------"
+          BAD=$(grep -E '^CONFIG_PACKAGE_(kmod-mt_wifi7|kmod-mt_wifi_osal|kmod-mt_hwifi|kmod-mtk_pci|kmod-connac_if|kmod-mt7993|kmod-warp|wifi-profile|mtwifi-cfg-ucode|luci-app-mtwifi-cfg|mwctl|wpad-openssl|hostapd-common|hostapd-utils|wpa-cli)=y' .config || true)
+          if [ -n "$BAD" ]; then
+            echo "$BAD"
+            echo "::error::有无线包被别的依赖强制拉起来了，看上面的列表，把依赖它的包也去掉（或改用 extra_packages 手动指定）"
+            exit 1
+          fi
+          echo "OK：无线包全部关闭"
+
+      - name: 缓存源码包 dl/
+        uses: actions/cache@v6
+        with:
+          path: openwrt/dl
+          key: dl-${{ hashFiles('openwrt/feeds.conf.default') }}
+          restore-keys: dl-
+
+      - name: 缓存 ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.VARIANT }}-${{ env.BRANCH }}-${{ github.run_id }}
+          restore-keys: ccache-${{ env.VARIANT }}-${{ env.BRANCH }}-
+
+      - name: 下载源码包
+        working-directory: openwrt
+        run: |
+          make -j"$(nproc)" download || make -j1 download V=s
+
+      - name: 编译
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache -M 3G >/dev/null
+          JOPT=""
+          if [ "${{ github.event.inputs.verbose }}" = "true" ]; then JOPT="V=s"; fi
+          make -j"$(nproc)" $JOPT 2>&1 | tee build.log
+
+      - name: 上传日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log-${{ github.run_number }}
+          path: openwrt/build.log
+          if-no-files-found: ignore
+
+      - name: 用 manifest 复核固件里没有无线
+        run: |
+          MANIFEST=$(ls openwrt/bin/targets/mediatek/filogic/*.manifest 2>/dev/null | head -1)
+          if [ -z "$MANIFEST" ]; then
+            echo "::warning::没找到 manifest，跳过复核"
+            exit 0
+          fi
+          echo "manifest: $MANIFEST"
+          if grep -nE '^(wpad|hostapd|wpa-cli|kmod-mt_wifi7|kmod-mt_wifi_osal|kmod-mt_hwifi|kmod-mtk_pci|kmod-connac_if|kmod-mt7993|kmod-warp|wifi-profile|mtwifi-cfg-ucode|mwctl)' "$MANIFEST"; then
+            echo "::warning::固件里仍有无线组件，见上面几行"
+          else
+            echo "复核通过：固件内无无线组件"
+          fi
+
+      - name: 收集固件
+        run: |
+          mkdir -p out
+          find openwrt/bin/targets -maxdepth 3 -type f \
+            \( -name '*.bin' -o -name '*.itb' -o -name '*.manifest' -o -name 'sha256sums' \) \
+            -exec cp -v {} out/ \;
+          ls -lh out/
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v7
+        with:
+          name: immortalwrt-${{ env.DEVICE }}-${{ env.VARIANT }}-${{ github.run_number }}
+          path: out
+          if-no-files-found: error
+          retention-days: 15
+
+      - name: 打 tag 时发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: out/*
+          fail_on_unmatched_files: true
