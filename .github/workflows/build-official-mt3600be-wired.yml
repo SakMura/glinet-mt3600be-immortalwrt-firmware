@@ -1,0 +1,210 @@
+name: Build Official ImmortalWrt (GL-MT3600BE · 有线版)
+
+# 官方 immortalwrt/immortalwrt 的有线版：去掉整套无线（mt76 驱动 + wpad/hostapd + 相关固件）。
+# 保留 LuCI、HNAT？—— 注意官方代码没有 MTK 的 HNAT 补丁，只有内核自带的 flow offload（nftables offload）。
+# 直接 clone 上游，不需要 fork、不需要 PAT。
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "源码仓库 URL"
+        type: string
+        required: true
+        default: "https://github.com/immortalwrt/immortalwrt.git"
+      source_branch:
+        description: "源码分支"
+        type: choice
+        required: true
+        default: "openwrt-25.12"
+        options:
+          - "openwrt-25.12"
+          - "master"
+      device:
+        description: "设备 profile 名"
+        type: string
+        required: true
+        default: "glinet_gl-mt3600be"
+      extra_packages:
+        description: "额外软件包（空格分隔，可留空）"
+        type: string
+        required: false
+        default: ""
+      verbose:
+        description: "输出详细日志（排错用）"
+        type: boolean
+        required: false
+        default: false
+  push:
+    tags:
+      - "official-v*-wired"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VARIANT: official-wired
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      REPO: ${{ github.event.inputs.source_repo || 'https://github.com/immortalwrt/immortalwrt.git' }}
+      BRANCH: ${{ github.event.inputs.source_branch || 'openwrt-25.12' }}
+      DEVICE: ${{ github.event.inputs.device || 'glinet_gl-mt3600be' }}
+      EXTRA: ${{ github.event.inputs.extra_packages || '' }}
+
+    steps:
+      - name: 清理 runner 磁盘
+        uses: jlumbroso/free-disk-space@v2.0.0
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get -qq update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -qq -y install \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget ccache libelf-dev
+          df -h /
+
+      - name: 拉取上游源码
+        run: |
+          if ! git ls-remote --heads "$REPO" "$BRANCH" | grep -q .; then
+            echo "::error::仓库 $REPO 上不存在分支 $BRANCH"
+            exit 1
+          fi
+          git clone --depth 1 --branch "$BRANCH" "$REPO" openwrt
+          cd openwrt
+          git log -1 --format='编译源码: %h %ad %s' --date=short
+
+      - name: 更新并安装 feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成 .config（关掉无线）
+        working-directory: openwrt
+        run: |
+          cat > .config <<CONF
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_mediatek_filogic_DEVICE_${DEVICE}=y
+          CONFIG_CCACHE=y
+          CONF
+
+          # 官方版无线是开源 mt76：驱动链 kmod-mt7996e -> kmod-mt76-connac -> kmod-mt76-core，
+          # 由设备包 kmod-mt7990-firmware 拉进来；wpad-openssl 来自 filogic 的默认包。
+          for p in \
+            kmod-mt7990-firmware kmod-mt7996e kmod-mt76-connac kmod-mt76-core \
+            kmod-cfg80211 kmod-mac80211 wireless-regdb \
+            wpad-openssl wpad-basic-mbedtls wpad-basic-wolfssl \
+            hostapd-common hostapd-utils wpa-cli
+          do
+            echo "# CONFIG_PACKAGE_$p is not set" >> .config
+          done
+
+          for p in $EXTRA; do echo "CONFIG_PACKAGE_$p=y" >> .config; done
+
+          # 兜底：如果镜像装配阶段还在找 kmod-mt7990-firmware（报 package not found），
+          # 放开下面这行——它是镜像级设备包列表，支持 "-包名" 表示从列表里移除
+          # echo "CONFIG_TARGET_DEVICE_PACKAGES_mediatek_filogic_DEVICE_${DEVICE}=\"-kmod-mt7990-firmware\"" >> .config
+
+          make defconfig
+
+          echo "---------- 应该还在的 ----------"
+          grep -E '^CONFIG_PACKAGE_(luci|firewall4|kmod-hwmon-pwmfan|mt7987-2p5g-phy-firmware)=' .config || true
+
+          echo "---------- 检查无线是否真的关掉了 ----------"
+          BAD=$(grep -E '^CONFIG_PACKAGE_(wpad|hostapd|wpa-cli|kmod-mt7990|kmod-mt7996e|kmod-mt76|kmod-cfg80211|kmod-mac80211|wireless-regdb)=y$' .config || true)
+          if [ -n "$BAD" ]; then
+            echo "$BAD"
+            echo "::error::有无线包被别的依赖强制拉起来了，看上面的列表，把依赖它的包也去掉"
+            exit 1
+          fi
+          echo "OK：无线包全部关闭"
+
+      - name: 缓存源码包 dl/
+        uses: actions/cache@v6
+        with:
+          path: openwrt/dl
+          key: dl-${{ hashFiles('openwrt/feeds.conf.default') }}
+          restore-keys: dl-
+
+      - name: 缓存 ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.VARIANT }}-${{ env.BRANCH }}-${{ github.run_id }}
+          restore-keys: ccache-${{ env.VARIANT }}-${{ env.BRANCH }}-
+
+      - name: 下载源码包
+        working-directory: openwrt
+        run: |
+          make -j"$(nproc)" download || make -j1 download V=s
+
+      - name: 编译
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache -M 3G >/dev/null
+          JOPT=""
+          if [ "${{ github.event.inputs.verbose }}" = "true" ]; then JOPT="V=s"; fi
+          make -j"$(nproc)" $JOPT 2>&1 | tee build.log
+
+      - name: 上传日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log-${{ github.run_number }}
+          path: openwrt/build.log
+          if-no-files-found: ignore
+
+      - name: 用 manifest 复核固件里没有无线
+        run: |
+          MANIFEST=$(ls openwrt/bin/targets/mediatek/filogic/*.manifest 2>/dev/null | head -1)
+          if [ -z "$MANIFEST" ]; then
+            echo "::warning::没找到 manifest，跳过复核"
+            exit 0
+          fi
+          echo "manifest: $MANIFEST"
+          if grep -nE '^(wpad|hostapd|wpa-cli|kmod-mt7990|kmod-mt7996e|kmod-mt76|kmod-mac80211|kmod-cfg80211|wireless-regdb)' "$MANIFEST"; then
+            echo "::warning::固件里仍有无线组件，见上面几行"
+          else
+            echo "复核通过：固件内无无线组件"
+          fi
+
+      - name: 收集固件
+        run: |
+          mkdir -p out
+          find openwrt/bin/targets -maxdepth 3 -type f \
+            \( -name '*.bin' -o -name '*.itb' -o -name '*.manifest' -o -name 'sha256sums' \) \
+            -exec cp -v {} out/ \;
+          ls -lh out/
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v7
+        with:
+          name: immortalwrt-official-${{ env.DEVICE }}-wired-${{ github.run_number }}
+          path: out
+          if-no-files-found: error
+          retention-days: 15
+
+      - name: 打 tag 时发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: out/*
+          fail_on_unmatched_files: true
